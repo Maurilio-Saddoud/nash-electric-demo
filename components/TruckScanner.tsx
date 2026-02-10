@@ -11,7 +11,10 @@ type BarcodeDetectorLike = {
   detect: (source: ImageBitmapSource) => Promise<Array<{ rawValue?: string }>>;
 };
 
-type BarcodeDetectorCtor = new (options?: { formats?: string[] }) => BarcodeDetectorLike;
+type BarcodeDetectorCtor = {
+  new (options?: { formats?: string[] }): BarcodeDetectorLike;
+  getSupportedFormats?: () => Promise<string[]>;
+};
 
 function getBarcodeDetectorCtor() {
   if (typeof window === "undefined") return null;
@@ -21,6 +24,7 @@ function getBarcodeDetectorCtor() {
 export function TruckScanner({ truckId }: TruckScannerProps) {
   const router = useRouter();
   const videoRef = useRef<HTMLVideoElement>(null);
+  const scanCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const frameRef = useRef<number | null>(null);
   const detectorRef = useRef<BarcodeDetectorLike | null>(null);
@@ -69,26 +73,55 @@ export function TruckScanner({ truckId }: TruckScannerProps) {
     }
   };
 
+  const ensureScanCanvas = (video: HTMLVideoElement) => {
+    if (!scanCanvasRef.current) {
+      scanCanvasRef.current = document.createElement("canvas");
+    }
+
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
+    const canvas = scanCanvasRef.current;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    return canvas;
+  };
+
   const scanFrame = async () => {
     const video = videoRef.current;
     const detector = detectorRef.current;
 
     if (!video || !detector) return;
 
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      frameRef.current = window.requestAnimationFrame(() => {
+        void scanFrame();
+      });
+      return;
+    }
+
     try {
-      const codes = await detector.detect(video);
+      const canvas = ensureScanCanvas(video);
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) {
+        throw new Error("Canvas 2D context unavailable");
+      }
+
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const codes = await detector.detect(canvas);
       const rawValue = codes.find((entry) => typeof entry.rawValue === "string" && entry.rawValue.length > 0)?.rawValue;
 
       if (rawValue) {
         const destination = routeFromRawValue(rawValue);
         if (!destination) {
           setMessage("Wrong truck QR.");
+        } else {
+          stopScanner();
+          router.push(destination);
           return;
         }
-
-        stopScanner();
-        router.push(destination);
-        return;
       }
     } catch {
       setMessage((current) => current ?? "Unable to read that QR code yet. Keep it centered and try again.");
@@ -105,13 +138,6 @@ export function TruckScanner({ truckId }: TruckScannerProps) {
     setMessage(null);
     setIsStarting(true);
 
-    const DetectorCtor = getBarcodeDetectorCtor();
-    if (!DetectorCtor) {
-      setMessage(isAutoStart ? "Tap to enable camera scan." : "Use Chrome on mobile for in-app scan.");
-      setIsStarting(false);
-      return;
-    }
-
     if (!navigator.mediaDevices?.getUserMedia) {
       setMessage("Camera access is not available in this browser.");
       setIsStarting(false);
@@ -119,12 +145,21 @@ export function TruckScanner({ truckId }: TruckScannerProps) {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" }
-        },
-        audio: false
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" }
+          },
+          audio: false
+        });
+      } catch {
+        // iOS Safari can reject advanced constraints; retry with minimal constraints.
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false
+        });
+      }
 
       streamRef.current = stream;
       const video = videoRef.current;
@@ -134,13 +169,41 @@ export function TruckScanner({ truckId }: TruckScannerProps) {
         return;
       }
 
-      detectorRef.current = new DetectorCtor({ formats: ["qr_code"] });
       video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      video.autoplay = true;
       video.setAttribute("playsinline", "true");
+      video.setAttribute("autoplay", "true");
+      video.setAttribute("muted", "true");
       await video.play();
+
+      const DetectorCtor = getBarcodeDetectorCtor();
+      if (DetectorCtor) {
+        try {
+          const supportedFormats = (await DetectorCtor.getSupportedFormats?.()) ?? [];
+          const detectorOptions =
+            supportedFormats.length > 0 && supportedFormats.includes("qr_code")
+              ? { formats: ["qr_code"] }
+              : undefined;
+          detectorRef.current = new DetectorCtor(detectorOptions);
+        } catch {
+          detectorRef.current = null;
+        }
+      } else {
+        detectorRef.current = null;
+      }
 
       setIsScanning(true);
       setIsStarting(false);
+
+      if (!detectorRef.current) {
+        setMessage(
+          "Camera is on, but in-browser QR scanning is not supported here. Use the iPhone Camera app to open the QR link."
+        );
+        return;
+      }
+
       frameRef.current = window.requestAnimationFrame(() => {
         void scanFrame();
       });
@@ -161,7 +224,13 @@ export function TruckScanner({ truckId }: TruckScannerProps) {
       <p className="text-sm font-semibold text-brand.blue/80">Scan QR</p>
 
       <div className="mt-2 min-h-0 flex-1 overflow-hidden rounded-xl border border-brand.blue/15 bg-slate-100">
-        <video ref={videoRef} className={`h-full w-full object-cover ${isScanning ? "block" : "hidden"}`} muted />
+        <video
+          ref={videoRef}
+          className={`h-full w-full object-cover ${isScanning ? "block" : "hidden"}`}
+          muted
+          playsInline
+          autoPlay
+        />
         {!isScanning ? (
           <div className="flex h-full items-center justify-center px-4 text-center text-sm text-brand.blue/55">
             {isStarting ? "Starting camera..." : "Camera preview"}
